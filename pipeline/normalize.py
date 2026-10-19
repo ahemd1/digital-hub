@@ -19,6 +19,40 @@ _VALUE_ALIASES = {
     "الاجمالي": "الإجمالى",
 }
 
+# Cross-table spelling variants that denote the same concept. Source bulletins spell
+# the same thing differently from sheet to sheet; keys are the already-folded forms.
+_CANONICAL_ALIASES = {
+    "الجمله": "جمله",  # residence "total": tables 2/18 write الجمله, table 10 writes جمله
+    "بور سعيد": "بورسعيد",  # Port Said: ملحق 1 splits the word, tables 2/18 do not
+}
+
+# Broken spacing inside longer labels (substring, not whole-cell, aliases).
+_SUBSTRING_FIXES = {
+    "مشغلواالمصانع": "مشغلوا المصانع",
+}
+
+_CANONICAL = True
+
+
+def set_canonical(enabled: bool) -> None:
+    """Enable/disable cross-table spelling unification (enabled by default)."""
+    global _CANONICAL
+    _CANONICAL = bool(enabled)
+
+
+def canonical_enabled() -> bool:
+    return _CANONICAL
+
+
+def canonicalize(text: str) -> str:
+    """Collapse known cross-table spelling variants onto one canonical value."""
+    for broken, fixed in _SUBSTRING_FIXES.items():
+        text = text.replace(broken, fixed)
+    for variant, canonical in _CANONICAL_ALIASES.items():
+        if text == variant:
+            return canonical
+    return text
+
 
 def _strip_bilingual(text: str) -> str:
     """Keep the Arabic portion when cells embed English on a new line."""
@@ -59,6 +93,8 @@ def normalize_arabic(value: Any) -> str:
     )
     text = text.translate(trans)
     text = _WHITESPACE_RE.sub(" ", text).strip()
+    if _CANONICAL:
+        text = canonicalize(text)
     return _VALUE_ALIASES.get(text, text)
 
 

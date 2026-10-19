@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from normalize import clean_label, format_value, normalize_arabic
+from normalize import canonical_enabled, clean_label, format_value, normalize_arabic
 
 OUTPUT_COLUMNS = [
     "رقم_الجدول",
@@ -31,6 +31,22 @@ INDICATORS = {
 }
 
 UNIT = "عدد"
+
+# "Republic total" governorate and "all" residence. The source workbook spells these
+# differently per sheet (table 10 vs tables 2/18 vs ملحق 1); the canonical constants
+# unify them, the raw constants reproduce the provided sample verbatim.
+GOV_TOTAL_CANONICAL = "اجمالي الجمهوريه"
+GOV_TOTAL_RAW = "إجمالى الجمهورية"
+RESIDENCE_TOTAL_CANONICAL = "جمله"
+RESIDENCE_TOTAL_RAW = "جملة"
+
+
+def _gov_total() -> str:
+    return GOV_TOTAL_CANONICAL if canonical_enabled() else GOV_TOTAL_RAW
+
+
+def _residence_total() -> str:
+    return RESIDENCE_TOTAL_CANONICAL if canonical_enabled() else RESIDENCE_TOTAL_RAW
 
 
 def _empty_row(**overrides: Any) -> dict[str, Any]:
@@ -159,7 +175,7 @@ def parse_occupation(df: pd.DataFrame) -> pd.DataFrame:
                         "رقم_الجدول": sheet_name,
                         "اسم_المؤشر": INDICATORS[sheet_name],
                         # Sheet is republic-level occupation breakdown
-                        "محافظات الجمهورية": "إجمالى الجمهورية",
+                        "محافظات الجمهورية": _gov_total(),
                         "محل الإقامة": normalize_arabic(residence),
                         "النوع": normalize_arabic(gender),
                         "الاقسام الرئيسية للمهن": normalize_arabic(occupation),
@@ -209,7 +225,7 @@ def parse_appendix(df: pd.DataFrame) -> pd.DataFrame:
                         "رقم_الجدول": sheet_name,
                         "اسم_المؤشر": INDICATORS[sheet_name],
                         "محافظات الجمهورية": normalize_arabic(gov),
-                        "محل الإقامة": "جملة",  # sample keeps ta-marbuta here
+                        "محل الإقامة": _residence_total(),  # unify with tables 2/18/10
                         "النوع": genders[offset],
                         "القطاع": metrics[offset],
                         "القيمة": val,

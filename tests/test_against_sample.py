@@ -1,4 +1,9 @@
-"""Assert the 27-row Sample_Output.csv is a subset of the generated extract."""
+"""Assert the 27-row Sample_Output.csv is a subset of the generated extract.
+
+Comparison is spelling-agnostic: both sides are run through the same Arabic
+canonicalization, so cross-table unification (بور سعيد vs بورسعيد, الجمله vs جمله)
+does not hide a genuine key/value mismatch.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,11 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "pipeline"))
+
+from normalize import normalize_arabic, set_canonical  # noqa: E402
+
+set_canonical(True)
 
 KEY_COLS = [
     "رقم_الجدول",
@@ -29,6 +39,8 @@ def _prep(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for col in out.columns:
         out[col] = out[col].fillna("").astype(str).str.strip()
+    for col in KEY_COLS:
+        out[col] = out[col].map(normalize_arabic)
     out["القيمة"] = pd.to_numeric(out["القيمة"], errors="coerce")
     return out
 

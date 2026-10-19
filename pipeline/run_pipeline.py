@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from parsers import OUTPUT_COLUMNS, parse_workbook  # noqa: E402
+from normalize import set_canonical  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,7 +29,16 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Destination CSV path",
     )
+    parser.add_argument(
+        "--sample-spellings",
+        action="store_true",
+        help=(
+            "Keep the provided sample's literal spellings instead of unifying "
+            "cross-table variants (e.g. بور سعيد/بورسعيد, الجمله/جملة)."
+        ),
+    )
     args = parser.parse_args(argv)
+    set_canonical(not args.sample_spellings)
 
     input_path = Path(args.input)
     output_path = Path(args.output)
