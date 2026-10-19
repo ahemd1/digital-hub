@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+*.xlsx
+_sheet_*.json
+_sample_*.json
+_input_*.json
+_inspect.py
