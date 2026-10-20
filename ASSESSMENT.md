@@ -40,7 +40,7 @@ Connecting dashboards directly to the **production** OLTP Postgres is a false ec
 
 - **Locks & contention:** Analytical scans compete with OLTP writes; long queries hold buffers and can block or slow checkouts/registrations.
 - **I/O & cache pollution:** Full-table or large-range scans push hot transactional pages out of shared buffers.
-- **No columnar / MPP scan path:** Row-store Postgres is optimized for point lookups and short transactions, not wide historical aggregations. Warehouses/ClickHouse use columnar storage, compression, and vectorized execution.
+- **It cannot answer the business question:** ERP data is in SQL Server, so "store sales + web traffic" cannot be joined inside the web PostgreSQL without moving data anyway.
 - **Schema coupling:** Report models freeze production tables; product changes become dashboard breakages.
 - **Security & blast radius:** Broad read access to PII/transaction tables increases risk.
 
@@ -82,8 +82,7 @@ Before changing modes, check what the Lookup query selects: loading the whole ta
 CREATE TABLE user_sessions (
     user_id       UInt64,
     session_id    UInt64,
-    session_start DateTime,
-    -- other columns
+    session_start DateTime
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(session_start)          -- coarse, time-based, low cardinality
