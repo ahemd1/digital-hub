@@ -50,56 +50,15 @@ Use a replica at minimum, and preferably curated OLAP tables fed by Airflow/dbt.
 
 ### Task 1.2: Dimension & Fact Modeling
 
-#### 1. Conformed `dim_customers`
+**A. Conformed `dim_customers`.** Business identity is `(source_system, source_customer_id)`; IDs are **not** assumed globally unique. A `customer_id_map` table maps each source ID to one surrogate `customer_key`; facts reference only the surrogate key. Challenges: same person with several web accounts or in both systems; shared/typo'd/missing emails and phones; Arabic/English or spelling variants of names; guests with no account; merges/splits discovered later (re-pointing keys, history); privacy/consent for PII. *Matching rules are not specified by the assessment.* **[Assumption/proposal]**: deterministic rules first (exact normalized email, then phone), a review queue for fuzzy matches, `match_rule` recorded for auditability.
 
-Design one customer dimension consumed by both store and web facts:
+**B. Junk dimension.** Small, independent, low-cardinality flags are combined into one dimension `dim_order_profile` (one row per *combination*), and the fact stores a single small key. Here 3 × 3 × 2 = 18 possible combinations. It keeps the fact narrow and avoids three tiny dimensions. Whether all 18 occur is **unknown**; the DDL pre-loads all 18 **[Assumption]**, or load only observed combos and add new ones as they arrive.
 
-- **Surrogate key:** `customer_sk` (warehouse-generated).
-- **Natural / source keys:** `erp_customer_id`, `web_user_id` (nullable until matched), plus stable business attributes (email, phone, national id if available).
-- **Matching:** deterministic keys first (email/phone normalized); then fuzzy name+address; maintain a mapping table (`source_system`, `source_id`, `customer_sk`, `match_confidence`, `match_method`).
-- **Golden record:** pick surviving attributes by survivorship rules (e.g. ERP wins for billing address, web wins for last login email).
+**C. SCD Type 2 (address).** Each change expires the current row (`effective_to`, `is_current=false`) and inserts a new row (`effective_from`, `effective_to=NULL`, `is_current=true`); facts join on the version valid at order time, so sales are attributed to the region at purchase time. **Verified** on PG 16: initial load, an unchanged re-run (adds nothing), a move, a brand-new customer, the point-in-time join, and a one-current-row-per-customer unique partial index. **[Assumption]** half-open `[from, to)` intervals and timestamp (not date) granularity; two changes in the same instant would need a sequence/tie-break (not tested). A dbt `snapshot` outline is in the SQL file (check the ClickHouse adapter's snapshot support for your versions; not verified here).
 
-**Challenges:** duplicate accounts, shared household phones/emails, typos, GDPR/consent differences between systems, late-arriving matches that require fact re-keying, and conflicting demographics.
+**D. SCD Type 3 (loyalty tier).** Columns `loyalty_tier_current`, `loyalty_tier_previous` (+ optional change timestamp) on the **same customer row**; update shifts current → previous then sets the new tier, only when the value changed. **Verified** on PG 16. SCD2 adds rows and keeps full history; SCD3 overwrites in place and keeps one prior value.
 
-#### 2. Junk dimension for degenerate flags
 
-`payment_method` × `delivery_type` × `promotion_applied` are low-cardinality flags. A **junk dimension** (`dim_order_context`) holds the Cartesian product (or observed combinations) with a single `order_context_sk` on the sales fact. Facts stay narrow; filters remain dimensional without three tiny snowflake tables.
-
-Example grain: one row per `(payment_method, delivery_type, promotion_applied)`.
-
-#### 3. SCD Type 2 (address) vs SCD Type 3 (loyalty)
-
-**SCD2 — shipping address (history):** keep versions with `valid_from`, `valid_to`, `is_current`. Facts store `customer_address_sk` (or `customer_sk` + address version) as of order date.
-
-dbt incremental outline:
-
-```sql
--- models/dim_customer_address.sql
-{{ config(materialized='incremental', unique_key='address_sk') }}
-
-with incoming as (
-  select
-    {{ dbt_utils.generate_surrogate_key(['customer_sk', 'valid_from']) }} as address_sk,
-    customer_sk,
-    shipping_address,
-    region_id,
-    valid_from,
-    cast(null as timestamp) as valid_to,
-    true as is_current
-  from {{ ref('stg_customer_address_changes') }}
-),
-closed as (
-  -- on incremental runs: close prior is_current rows when address changed
-  select ...
-)
-select * from incoming
-{% if is_incremental() %}
-union all
-select * from closed
-{% endif %}
-```
-
-**SCD3 — loyalty tier:** wide current row with `current_tier`, `previous_tier` (and maybe `tier_changed_at`). No full history—only current vs previous for quick deltas. Schema differs by storing prior value in columns on the same row rather than adding version rows.
 
 ---
 
