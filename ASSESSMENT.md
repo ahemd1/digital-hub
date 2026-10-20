@@ -1,6 +1,6 @@
 # Data Engineering Technical Assessment
 
-Answers for Parts 1–3 (English). The Excel ingestion pipeline is in `pipeline/` (see `README.md`).
+The Excel ingestion pipeline is in `pipeline/` (see `README.md`).
 
 ---
 
@@ -10,19 +10,30 @@ Answers for Parts 1–3 (English). The Excel ingestion pipeline is in `pipeline/
 
 #### 1. Warehouse vs Lake vs Lakehouse — recommendation
 
-| Pattern | Strengths | Gaps for this scenario |
-|---|---|---|
-| **Traditional data warehouse** | Strong schema, BI-friendly, governance | Awkward for raw clickstream and large semi-structured web logs; costly to land every event before modeling |
-| **Data lake** | Cheap storage for raw ERP extracts + clickstream | Weak concurrency/governance for executive dashboards; SQL/engineering burden without a warehouse layer |
-| **Data lakehouse** | Lake storage for raw/history + warehouse-style tables for analytics; supports batch + streaming | Needs clear medallion/layering and ownership |
+| | Traditional DWH | Data Lake | Lakehouse |
+|---|---|---|---|
+| Data | Structured, modeled (star schemas) | Raw files of any shape, usually on object storage | Open table formats on object storage, with ACID/metadata layer |
+| Schema | On write | On read | Both |
+| Strengths | Fast, predictable BI/SQL; governance | Cheap, flexible, ML/raw retention | One copy for BI + ML |
+| Weaknesses | Less flexible for unstructured data | Weak governance/performance without extra layers | More moving parts |
+| Fit here | **Strong**: sources are two relational DBs; needs are cohort analysis, funnels, dashboards | Little need: no unstructured data is mentioned | Possible later; not required by the stated needs |
 
-**Recommendation: Lakehouse**, aligned to the target stack (ClickHouse + PostgreSQL analytics, dbt, Airflow).
+**Recommendation [Practice, grounded in the stated stack]:** a **warehouse-style architecture with ClickHouse as the analytical (OLAP) store**, ELT with dbt, orchestrated by Airflow. The assessment names ClickHouse/PostgreSQL/dbt/Airflow and does not mention object storage, so I do not make a lake/lakehouse layer mandatory. *Optional* (not required): add object-storage raw retention if later needs include replay at scale, semi-structured data or ML.
 
-- **OLTP (keep out of the analytics path for heavy BI):** SQL Server ERP and the e-commerce PostgreSQL remain systems of record for transactions and registrations. Nightly/CDC extracts land in the lake (bronze), are cleaned (silver), and modeled (gold).
-- **OLAP:** Curated dimensional models and aggregates live in ClickHouse (and/or analytics PostgreSQL) for cohort analysis, funnels, and dashboards. ClickHouse handles high-volume clickstream; Postgres can hold smaller conformed dimensions and serving tables if needed.
+**OLTP vs OLAP.** OLTP (the ERP SQL Server and the e-commerce PostgreSQL) serves many small concurrent reads/writes of individual rows, normalized, with strict transactional guarantees. OLAP (ClickHouse) serves fewer, large scans and aggregations over history, columnar and denormalized/dimensional. Analytics here (cohorts, funnels, executive dashboards) is OLAP.
 
-This hybrid fits store sales (structured, moderate volume) plus web events (high volume, evolving schema) without querying production OLTP for analytics.
+```mermaid
+flowchart LR
+  ERP[(SQL Server ERP<br/>OLTP)] -->|SSIS nightly extract| STG
+  WEB[(PostgreSQL web platform<br/>OLTP)] -->|batch/CDC extract - assumption| STG
+  subgraph CH[ClickHouse - OLAP]
+    STG[raw / staging] -->|dbt| MART[dim_* / fact_* marts]
+  end
+  AF{{Airflow}} -. orchestrates extract, load, dbt run/test .-> CH
+  MART --> BI[Power BI / Tableau]
+```
 
+**Roles.** *SQL Server*: source of store sales/customers. *SSIS*: existing nightly extract/load; keeping it initially limits migration risk **[Assumption]**. *PostgreSQL (web)*: source of traffic and registrations; the PDF also lists PostgreSQL in the target stack without saying what it does there — **open question** (my assumption: it stays an OLTP source, and optionally holds metadata). *ClickHouse*: analytical store. *dbt*: SQL transformations, tests, lineage. *Airflow*: scheduling, dependencies, retries, alerting.
 #### 2. Power BI / Tableau on production PostgreSQL
 
 Connecting dashboards directly to the **production** OLTP Postgres is a false economy:
