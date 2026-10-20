@@ -66,170 +66,71 @@ Use a replica at minimum, and preferably curated OLAP tables fed by Airflow/dbt.
 
 ### Task 2.1: SSIS Lookup Cache Modes
 
-#### 1. Modes
+**Cache modes.** *Full cache*: the whole reference result set is loaded into memory before rows flow; fastest per row, no per-row DB calls, memory = size of the loaded result set. *Partial cache*: starts empty; rows are cached as lookups succeed (up to a configured cache size); a miss queries the database; there is an option to also cache "not found" keys. *No cache*: every input row issues a database query; least memory, most round-trips.
 
-| Mode | Behavior |
-|---|---|
-| **Full Cache** | Load entire reference set into memory before rows flow; fastest lookups; highest memory |
-| **Partial Cache** | Cache entries as they are looked up (with size limit); miss → query DB, then cache |
-| **No Cache** | Every row hits the database; lowest memory; most round-trips |
+**Recommendation.** For the stated facts (15 M-row dimension, out-of-memory today, 95 % of transactions on 100 products) **Partial Cache** is the natural choice: the ~100 hot products are cached after their first lookups, so ~95 % of rows should avoid the DB, and memory stays bounded. Trade-off: the remaining ~5 % (long tail) mostly hit the DB at least once per distinct key; hit-rate depends on the real distribution, cache size and row order, none of which I have — so **treat the expected benefit as a hypothesis to measure**, not a guarantee.
+Before changing modes, check what the Lookup query selects: loading the whole table with many columns is the usual cause of the memory failure; selecting only the product key and category ID, and filtering to needed rows, reduces memory in every mode. Full Cache on a *narrowed* query may even fit — measure it. Optional optimization (needs testing): a first Lookup in Full Cache on just the top-100 products, with its no-match output feeding a second Partial/No-Cache Lookup against the full table; it adds complexity and assumes the hot set is stable.
 
-#### 2. Choice for OOM + top-100 products
-
-Use **Partial Cache**. Full Cache on 15M products caused OOM. Partial Cache keeps the hot ~100 products in memory after first hits (covering ~95% of traffic) while avoiding loading the full dimension. No Cache would thrash the DB with per-row lookups.
-
-Optionally pre-seed a small reference query for the top 100 SKUs and keep cache size capped to that working set.
-
-#### 3. No-match row redirection
-
-Configure the Lookup error output (or “Redirect rows to no match output”) to send unmatched product keys to an error/quarantine path: log `order_id`, `product_id`, package execution id; do not silently drop. Optionally default `category_id` only in a controlled downstream path after review.
-
+**Row redirection.** Set the Lookup's no-match behavior to *Redirect rows to no match output* (not *Ignore failure*, which leaves NULL category silently, and not *Fail component*, which stops the package). Send that output to a quarantine/error table (order id, product id, source timestamp, package run id) and either (a) load the rows into the fact with an "Unknown" product member, or (b) hold them until the dimension catches up — a business choice **[open question]**. Reprocess quarantined rows after the product dimension loads. Monitor the quarantine row count.
 ---
 
 ### Task 2.2: ClickHouse Partitioning & Ordering
 
-#### 1. Strategy for `user_sessions`
+1- columns `user_id`, `session_id`, `session_start` **[Assumption]**.
 
-- **PARTITION BY** `toYYYYMM(event_date)` (monthly). Matches retention, tiered storage, and partition pruning for date-bounded funnels.
-- **ORDER BY** `(user_id, event_time)` (primary key / sorting key). Enables efficient per-user session scans and sparse index granules on `user_id`.
+```sql
+CREATE TABLE user_sessions (
+    user_id       UInt64,
+    session_id    UInt64,
+    session_start DateTime,
+    -- other columns
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(session_start)          -- coarse, time-based, low cardinality
+ORDER BY (user_id, session_start);            -- primary (sparse) index
+```
 
-Also keep `event_date` as a proper Date column for partition expression clarity.
-
-#### 2. Why not `user_id` or millisecond timestamp partitions
-
-ClickHouse performs best with a **modest** number of partitions (typically dozens to low hundreds, not millions). Partitioning by `user_id` or `toUnixTimestamp64Milli(event_time)` creates an explosion of parts:
-
-- Heavy merge scheduler load and “too many parts” errors
-- Poor insert batching and memory overhead per part
-- Ineffective pruning (queries rarely hit one user partition usefully at lake scale)
-
-Use partitions for coarse time (or large tenant), and put selective columns in `ORDER BY`, not in `PARTITION BY`.
-
+* **Partitioning** is mainly for data management (drop/move/TTL by period) and coarse pruning; it is *not* the main speed tool. **`ORDER BY`** defines on-disk sort order and the sparse primary index (one index entry per granule, default 8,192 rows); queries filtering on a *prefix* of the key skip most granules. **Data-skipping indexes** (minmax, set, bloom filter) are optional secondary aids for columns not in the key; they help only if the data is clustered correlated with the column.
+* `(user_id, session_start)` suits "history of a user / user in a time range". If most queries are time-first aggregates across all users, a key leading with a coarse time bucket may be better; if `user_id` has very high cardinality and queries rarely filter by it, put lower-cardinality filter columns first. **To confirm before finalizing:** dominant filters, time-range sizes, ingestion rate, retention/TTL, typical result sizes.
+* **2- Why `PARTITION BY user_id` or millisecond timestamp is a mistake:** cardinality → an enormous number of partitions (each partition's data lives in separate parts; parts from different partitions are never merged together). Consequences: many tiny parts, merge background work cannot keep up, insert errors such as "too many parts", more file handles/metadata, slower startup and queries that must open many parts, and in replicated setups more coordination metadata. Check the current ClickHouse documentation for exact thresholds/settings.
 ---
 
 ## Part 3: SQL & Linux Hands-on Mastery
 
-### Task 3.1: Logical order & window rewrite
+### Task 3.1 (SQL: `sql/window_functions.sql`, executed on PG 16)
 
-#### 1. Logical clause order
+1. **Logical order:** `FROM → WHERE → GROUP BY → HAVING → window functions (OVER) → SELECT → (DISTINCT) → ORDER BY → LIMIT`.
+2. **The bug.** **Verified:** the original query does *not* error in PostgreSQL (all its columns are grouped) — it just answers the wrong question. Grain is `(user_id, page_id, visit_time)`, so `HAVING COUNT(*) > 1` keeps only *identical duplicate events*. `LAG/LEAD` then run over those few survivors, so the "previous/next page" are not the user's real neighbouring visits. On my test data it returned one row with NULL neighbours. "Interaction" for a page is a count per **(user, page)** (or per page) — a *different grain* from the event grain.
+3. **Fix:** decide qualifying `(user_id, page_id)` pairs in a CTE (`GROUP BY … HAVING COUNT(*) > 1`), join back to the raw events, then compute `LAG/LEAD` over the remaining events. Verified output: a page visited once by a user (`blog`) is removed *before* `LAG/LEAD`, so transitions skip it. Whether "low interaction" means per (user, page) or per page overall is **not stated**; both variants are in the file.
+4. **Ties.** Two visits by one user with the same `visit_time` have no defined order. Adding `page_id` to `ORDER BY` only makes the result repeatable, not correct. A real tie-break needs an event id / click sequence, which the schema does not contain.
 
-For the given query shape, logical processing is:
+### Task 3.2 (SQL: `sql/deduplicate_orders.sql`, executed on PG 16)
 
-1. `FROM`
-2. `WHERE`
-3. `GROUP BY`
-4. `HAVING`
-5. **Window** (`OVER` / `LAG` / `LEAD`) — evaluated after `HAVING`, on the grouped result
-6. `SELECT` (including window outputs)
-7. (`ORDER BY` / `LIMIT` if present — not in the given query)
+`DELETE … USING (SELECT ctid, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY load_timestamp, ctid)) … WHERE rn > 1`. **Verified** on the PDF's sample rows plus edge cases: earliest `load_timestamp` kept; exact tie → physically-first row kept (arbitrary, not a business rule); NULL `load_timestamp` sorts last (kept only if alone); rolled back after testing. `ctid` is a physical locator, valid only within the statement.
+**Why `NOT IN` is bad at 100 M rows:** a NULL in the subquery makes the predicate UNKNOWN (verified: matches 0 rows); PostgreSQL may not plan it as an anti-join (hashed subplan limited by `work_mem`); one huge DELETE creates ~one dead tuple per removed row (WAL, bloat, a long transaction, vacuum held back). **Alternative:** rebuild — `INSERT … SELECT DISTINCT ON (order_id) … ORDER BY order_id, load_timestamp`, validate counts, swap by rename, add a primary key to stop recurrence; or batched deletes. I did **not** run the rebuild at scale; I only ran `DISTINCT ON` on the small test set. Validate on a copy first.
 
-#### 2. The bug and rewrite
-
-`LAG`/`LEAD` run **after** `GROUP BY`/`HAVING`. Grouping to `(user_id, page_id, visit_time)` collapses duplicates before the window, so “page transitions” are computed on the aggregated grain, not the filtered raw hit stream. `HAVING COUNT(*) > 1` also does not mean “keep pages with more than one interaction globally”—it filters groups after aggregation.
-
-Correct pattern: aggregate/filter in a CTE, then apply windows on the filtered detail (or on the intended grain):
-
-```sql
-WITH page_counts AS (
-  SELECT user_id, page_id
-  FROM web_traffic
-  WHERE visit_time >= DATE '2026-07-01'
-  GROUP BY user_id, page_id
-  HAVING COUNT(*) > 1
-),
-filtered AS (
-  SELECT w.user_id, w.page_id, w.visit_time
-  FROM web_traffic w
-  INNER JOIN page_counts p
-    ON w.user_id = p.user_id
-   AND w.page_id = p.page_id
-  WHERE w.visit_time >= DATE '2026-07-01'
-)
-SELECT
-  user_id,
-  page_id,
-  visit_time,
-  LAG(page_id)  OVER (PARTITION BY user_id ORDER BY visit_time) AS previous_page,
-  LEAD(page_id) OVER (PARTITION BY user_id ORDER BY visit_time) AS next_page
-FROM filtered;
-```
-
----
-
-### Task 3.2: De-duplication DML
-
-#### 1. Delete duplicates, keep earliest `load_timestamp`
-
-```sql
-DELETE FROM raw_orders a
-USING raw_orders b
-WHERE a.order_id = b.order_id
-  AND a.load_timestamp > b.load_timestamp;
-```
-
-If timestamps can tie, add a tie-breaker (e.g. `ctid`):
-
-```sql
-DELETE FROM raw_orders a
-USING raw_orders b
-WHERE a.order_id = b.order_id
-  AND (
-        a.load_timestamp > b.load_timestamp
-     OR (a.load_timestamp = b.load_timestamp AND a.ctid > b.ctid)
-      );
-```
-
-#### 2. Why `NOT IN` deletes fail at 100M rows — alternative
-
-A `DELETE ... WHERE ctid NOT IN (SELECT ...)` style plan often:
-
-- Builds a huge anti-join / materializes massive ID lists
-- Causes long transactions, bloat, and WAL spikes
-- Holds locks that block ingest
-
-**Better at scale:** build a clean table, then swap:
-
-```sql
-CREATE TABLE raw_orders_dedup AS
-SELECT DISTINCT ON (order_id) *
-FROM raw_orders
-ORDER BY order_id, load_timestamp ASC, ctid ASC;
-
-BEGIN;
-ALTER TABLE raw_orders RENAME TO raw_orders_old;
-ALTER TABLE raw_orders_dedup RENAME TO raw_orders;
-COMMIT;
--- recreate indexes/constraints; DROP raw_orders_old after validation
-```
-
-Or batch deletes by `order_id` ranges in Airflow to keep transactions small.
-
----
-
-### Task 3.3: Linux & Logs
-
-#### 1. Find and kill the process on port 8080
+### Task 3.3 (Linux). Verified on a test listener: `ss`, `lsof -t`, `grep -C`. `kill` was not run against anything real, and `kill -9` was never executed.
 
 ```bash
-# identify listener
-sudo lsof -iTCP:8080 -sTCP:LISTEN -n -P
-# or: sudo fuser 8080/tcp
+# 1) find the process listening on TCP 8080 (either one)
+sudo ss -ltnp 'sport = :8080'
+sudo lsof -nP -iTCP:8080 -sTCP:LISTEN
+# verify it is the right process BEFORE killing
+ps -p <PID> -o pid,ppid,user,etime,cmd
+# terminate: try graceful first; -9 is a last resort (no cleanup, can leave locks/temp files)
+kill <PID>
+kill -9 <PID>
+# the "one-liner" form the task asks for (only after you have verified the PID):
+sudo kill -9 $(sudo lsof -t -iTCP:8080 -sTCP:LISTEN)
 
-# forceful terminate (replace <PID>)
-sudo kill -9 <PID>
-
-# one-liner variants:
-sudo fuser -k 8080/tcp
-# or: kill -9 $(sudo lsof -t -iTCP:8080 -sTCP:LISTEN)
-```
-
-#### 2. Search a 10 GB log with context (no editor)
-
-```bash
+# 2) 5 lines of context before AND after each match, no editor, streams the file
 grep -n -C 5 'OutOfMemoryError' /var/log/airflow/dag_execution.log
+# same thing, explicit:  grep -n -B 5 -A 5 'OutOfMemoryError' ...
 ```
+`grep` streams, so a 10 GB file is not loaded into memory; redirect (`> oom_matches.txt`) or pipe to `less` if there are many matches. `-F` (fixed string) is an option for plain text.
 
 ---
+
 
 ## Excel Pipeline — Scalability Note
 
