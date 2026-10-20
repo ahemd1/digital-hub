@@ -21,7 +21,7 @@ CREATE TABLE dim_customers (            -- one row per resolved (de-duplicated) 
     web_user_id         text,
     full_name           text,
     email_normalized    text,                       -- ASSUMPTION: a candidate matching attribute
-    -- SCD3 columns (see section D):
+    -- SCD3 columns
     loyalty_tier_current  text,
     loyalty_tier_previous text,
     loyalty_tier_changed_at timestamptz
