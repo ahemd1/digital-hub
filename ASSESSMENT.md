@@ -96,16 +96,16 @@ ORDER BY (user_id, session_start);            -- primary (sparse) index
 
 ## Part 3: SQL & Linux Hands-on Mastery
 
-### Task 3.1 (SQL: `sql/window_functions.sql`, executed on PG 16)
+### Task 3.1 (SQL: `sql/window_functions.sql`, Proposed Logical Design in SQL folder)
 
 1. **Logical order:** `FROM → WHERE → GROUP BY → HAVING → window functions (OVER) → SELECT → (DISTINCT) → ORDER BY → LIMIT`.
 2. **The bug.** **Verified:** the original query does *not* error in PostgreSQL (all its columns are grouped) — it just answers the wrong question. Grain is `(user_id, page_id, visit_time)`, so `HAVING COUNT(*) > 1` keeps only *identical duplicate events*. `LAG/LEAD` then run over those few survivors, so the "previous/next page" are not the user's real neighbouring visits. On my test data it returned one row with NULL neighbours. "Interaction" for a page is a count per **(user, page)** (or per page) — a *different grain* from the event grain.
 3. **Fix:** decide qualifying `(user_id, page_id)` pairs in a CTE (`GROUP BY … HAVING COUNT(*) > 1`), join back to the raw events, then compute `LAG/LEAD` over the remaining events. Verified output: a page visited once by a user (`blog`) is removed *before* `LAG/LEAD`, so transitions skip it. Whether "low interaction" means per (user, page) or per page overall is **not stated**; both variants are in the file.
 4. **Ties.** Two visits by one user with the same `visit_time` have no defined order. Adding `page_id` to `ORDER BY` only makes the result repeatable, not correct. A real tie-break needs an event id / click sequence, which the schema does not contain.
 
-### Task 3.2 (SQL: `sql/deduplicate_orders.sql`, executed on PG 16)
+### Task 3.2 (SQL: `sql/deduplicate_orders.sql`, Proposed Logical Design in SQL folder)
 
-`DELETE … USING (SELECT ctid, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY load_timestamp, ctid)) … WHERE rn > 1`. **Verified** on the PDF's sample rows plus edge cases: earliest `load_timestamp` kept; exact tie → physically-first row kept (arbitrary, not a business rule); NULL `load_timestamp` sorts last (kept only if alone); rolled back after testing. `ctid` is a physical locator, valid only within the statement.
+`DELETE … USING (SELECT ctid, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY load_timestamp, ctid)) … WHERE rn > 1`.Verified on the PDF's sample rows plus edge cases: earliest `load_timestamp` kept; exact tie → physically-first row kept (arbitrary, not a business rule); NULL `load_timestamp` sorts last (kept only if alone); rolled back after testing. `ctid` is a physical locator, valid only within the statement.
 **Why `NOT IN` is bad at 100 M rows:** a NULL in the subquery makes the predicate UNKNOWN (verified: matches 0 rows); PostgreSQL may not plan it as an anti-join (hashed subplan limited by `work_mem`); one huge DELETE creates ~one dead tuple per removed row (WAL, bloat, a long transaction, vacuum held back). **Alternative:** rebuild — `INSERT … SELECT DISTINCT ON (order_id) … ORDER BY order_id, load_timestamp`, validate counts, swap by rename, add a primary key to stop recurrence; or batched deletes. I did **not** run the rebuild at scale; I only ran `DISTINCT ON` on the small test set. Validate on a copy first.
 
 ### Task 3.3 (Linux). Verified on a test listener: `ss`, `lsof -t`, `grep -C`. `kill` was not run against anything real, and `kill -9` was never executed.
